@@ -1,0 +1,15 @@
+name: Verify packages
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '37 11 * * *'
+
+jobs:
+  no-subscription:
+    uses: ./.github/workflows/_verify-package.yaml
+    with:
+      git-repo: https://github.com/free-pmx/free-pmx-no-subscription.git
+      git-ref: main
+      build-container: ghcr.io/free-pmx/debian-essential:latest
+      build-type: deb-assemble

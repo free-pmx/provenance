@@ -1,0 +1,191 @@
+name: '[Verify package]'
+
+on:
+  workflow_call:
+    inputs:
+      git-repo:
+        description: Git repository containing the package source(s)
+        required: true
+        type: string
+      git-ref:
+        description: Git reference
+        required: true
+        type: string        
+      package-name:
+        description: Package name (optional)
+        required: false
+        default: ''
+        type: string
+      build-container:
+        description: Builder container image repo
+        required: true
+        type: string
+      build-type:
+        description: Build type
+        required: true
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+
+  prep:
+    runs-on: ubuntu-latest
+    outputs:
+      source-artifact: ${{ steps.source.outputs.name }}
+      git-commit: ${{ steps.source.outputs.git-commit }}
+      context: ${{ steps.context.outputs.json }}
+
+    steps:
+
+      - id: source
+        name: Obtain source archive, extract local copy
+        uses: free-pmx/actions/git-archive@experimental
+        with:
+          base-name: source
+          git-repo: ${{ inputs.git-repo }}
+          git-ref: ${{ inputs.git-ref }}
+          extract: true
+
+      - id: context
+        name: Resolve context from .buildmeta file
+        uses: free-pmx/actions/context-from-buildmeta@experimental
+        with:
+          source-dir: ${{ steps.source.outputs.extract-path }}
+
+  build-verify:
+    needs: prep
+    runs-on: ubuntu-latest
+    outputs:
+      build-deb: ${{ steps.build.outputs.deb }}
+
+    steps:
+
+      - id: source
+        name: Get package source
+        uses: free-pmx/actions/fetch-archive@experimental
+        with:
+          name: ${{ needs.prep.outputs.source-artifact }}
+
+      - id: build
+        name: Reproduce build
+        uses: free-pmx/actions/build-deb@experimental
+        with:
+          build-container: ${{ inputs.build-container }}
+          build-type: ${{ inputs.build-type }}
+          source-dir: ${{ steps.source.outputs.extract-path }}
+          context: ${{ needs.prep.outputs.context }}
+
+      - id: verify
+        name: Verify SHA256 checksum of the built package
+        env:
+          DEB: ${{ steps.build.outputs.deb }}
+          SHA256: ${{ fromJson(needs.prep.outputs.context).deb.sha256 }}
+        run: sha256sum --check <<< "${SHA256:?}  ${DEB:?}"
+
+  dist-verify:
+    needs: prep
+    runs-on: ubuntu-latest
+    outputs:
+      dist-deb-artifact: ${{ steps.dist-deb.outputs.name }}
+
+    steps:
+
+      - id: fetch
+        name: Fetch distributed package
+        uses: free-pmx/actions/fetch-deb@experimental
+        with:
+          context: ${{ needs.prep.outputs.context }}
+
+      - id: dist-deb
+        name: Archive distributed package as artifact
+        continue-on-error: true
+        uses: free-pmx/actions/archive@experimental
+        with:
+          base-name: dist
+          path: ${{ steps.fetch.outputs.deb }}
+
+      - id: verify
+        name: Verify SHA256 checksum of the distributed package      
+        env:
+          DEB: ${{ steps.fetch.outputs.deb }}
+          SHA256: ${{ fromJson(needs.prep.outputs.context).deb.sha256 }}
+        run: sha256sum --check <<< "${SHA256:?}  ${DEB:?}"
+
+  policy-check:
+    needs: [dist-verify]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/free-pmx/debian-forensic:latest
+
+    steps:
+
+      - id: dist-deb
+        name: Fetch previously downloaded distributed package
+        uses: free-pmx/actions/fetch-archive@experimental
+        with:
+          name: ${{ needs.dist-verify.outputs.dist-deb-artifact }}
+
+      - name: Lintian
+        shell: bash
+        run: |
+          lintian --allow-root --pedantic --display-info \
+            "${{ steps.dist-deb.outputs.extract-path}}/dist.deb"
+
+  report:
+    needs: [prep, build-verify, dist-verify]
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Report summary
+        env:
+          RES_BUILD: ${{ needs.build-verify.result }}
+          RES_DIST: ${{ needs.dist-verify.result }}
+          GIT_REPO: ${{ inputs.git-repo }}
+          GIT_COMMIT: ${{ needs.prep.outputs.git-commit }}
+          CONTEXT: ${{ needs.prep.outputs.context }}
+        run: |
+          # Build summary, fail if any result not a succes
+
+          : "${GIT_REPO:?} ${GIT_COMMIT:?} ${CONTEXT:?}"
+
+          report=$(mktemp --tmpdir --suffix=.json)
+
+          jq -n \
+            --arg git_repo "$GIT_REPO" \
+            --arg git_commit "$GIT_COMMIT" \
+            --arg res_build "$RES_BUILD" \
+            --arg res_dist "$RES_DIST" \
+            --arg context "$CONTEXT" \
+          '
+          ($context | fromjson) as $c |
+          {
+            generated: (now | todate),
+            package: $c.deb.package,
+            version: $c.deb.version,
+            sha256: $c.deb.sha256,
+            build: {
+              verify: $res_build,
+              git: {
+                repo: $git_repo,
+                commit: $git_commit
+              }
+            },
+            dist: {
+              verify: $res_dist,
+              url: $c.deb.url
+            }
+          }
+          ' > "$report"
+
+          >&2 tee -a "$GITHUB_STEP_SUMMARY" << EOF
+          \`\`\`yaml
+          $(yq -P < "$report")
+          \`\`\`
+          EOF
+
+          [[ "$RES_BUILD" == "success" ]]
+          [[ "$RES_DIST" == "success" ]]

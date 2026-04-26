@@ -1,0 +1,219 @@
+name: '[Create image]'
+
+on:
+  workflow_call:
+    inputs:
+      git-repo:
+        description: Git repository containing image source(s)
+        required: true
+        type: string
+      git-ref:
+        description: Git reference
+        required: false
+        default: 'main'
+        type: string
+      name:
+        description: Name of the image source directory, becomes image name
+        required: true
+        type: string
+      tags:
+        description: Space-separated list of tags for the image
+        required: false
+        default: 'latest'
+        type: string
+      registry:
+        description: Registry to push to
+        required: false
+        type: string
+      namespace:
+        description: Namespace within the registry
+        required: false
+        type: string
+      user:
+        description: Username for the registry
+        required: false
+        type: string
+
+    secrets:
+      password:
+        description: Password for the registry
+        required: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  NAME: ${{ inputs.name }}
+
+jobs:
+
+  build-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      repo: ${{ steps.push.outputs.repo }}
+      digest: ${{ steps.push.outputs.digest }}
+      manifest: ${{ steps.inspect.outputs.manifest }}
+      config: ${{ steps.inspect.outputs.config }}
+      annotations: ${{ steps.inspect.outputs.annotations }}
+      oci: ${{ steps.inspect.outputs.oci }}
+      debstrap: ${{ steps.debstrap.outputs.debstrap }}
+      os-release: ${{ steps.image-os-release.outputs.os-release }}
+      outdir-artifact: ${{ steps.outdir.outputs.name }}
+
+    steps:
+
+      - name: Ensure runner provides minimal toolset
+        uses: free-pmx/actions/apt-satisfy@experimental
+        with:
+          expr: >
+            debian-archive-keyring
+            bdebstrap
+
+      - id: source
+        name: Fetch image sources
+        uses: free-pmx/actions/git-archive@experimental
+        with:
+          base-name: ${{ env.NAME }}_source
+          git-repo: ${{ inputs.git-repo }}
+          git-ref: ${{ inputs.git-ref }}
+          extract: true
+
+      - id: build
+        name: Build image
+        env:
+          SOURCE: ${{ steps.source.outputs.git-repo }}
+          REVISION: ${{ steps.source.outputs.git-commit }}
+          SOURCE_DATE_EPOCH: ${{ steps.source.outputs.git-commit-ctime }}
+          _BUILD: ${{ steps.source.outputs.extract-path }}/${{ inputs.name }}/build
+        run: |
+          # Build the container image from the acquired build script
+
+          : "${NAME:?} ${SOURCE:?} ${REVISION:?} ${SOURCE_DATE_EPOCH:?} ${_BUILD:?}"
+
+          OUTDIR="$(mktemp -d --tmpdir "${NAME}.build-out.XXXXXX")"
+          export NAME SOURCE REVISION SOURCE_DATE_EPOCH OUTDIR
+          buildah unshare "$_BUILD"
+
+          >&2 tee -a "$GITHUB_OUTPUT" << EOF
+          out-dir=$OUTDIR
+          EOF
+
+      - id: inspect
+        name: Inspect image
+        env:
+          OUTDIR: ${{ steps.build.outputs.out-dir}}
+        run: |
+          # Save buildah inspect JSON,
+          # extract: Manifest, Config, ImageAnnotations and OCIv1
+
+          : "${NAME:?} ${OUTDIR:?}"
+
+          inspect="$OUTDIR/inspect.json"
+          buildah inspect "$NAME" | jq '.' > "$inspect"
+
+          >&2 tee -a "$GITHUB_OUTPUT" << EOF
+          manifest=$(jq -c '.Manifest | fromjson' < "$inspect")
+          config=$(jq -c '.Config | fromjson' < "$inspect")
+          annotations=$(jq -c '.ImageAnnotations' < "$inspect")
+          oci=$(jq -c '.OCIv1' < "$inspect")
+          EOF
+
+      - id: outdir
+        name: Archive output
+        uses: free-pmx/actions/archive@experimental
+        with:
+          base-name: ${{ env.NAME }}_outdir
+          path: ${{ steps.build.outputs.out-dir}}
+
+      - id: debstrap
+        name: Ingest debstrap processed output JSON
+        env:
+          OUTDIR: ${{ steps.build.outputs.out-dir}}
+        run: |
+          # Extract debstrap run summary
+
+          : "${OUTDIR:?}"
+
+          debstrap="$OUTDIR/debstrap.json"
+
+          >&2 tee -a "$GITHUB_OUTPUT" << EOF
+          debstrap=$(jq -c '.' < "$debstrap")
+          EOF
+
+      - id: image-os-release
+        name: Test run container, get its os-release
+        uses: free-pmx/actions/image-os-release@experimental
+        with:
+          name: ${{ env.NAME }}
+
+      - id: push
+        name: Push image
+        uses: free-pmx/actions/buildah-push@experimental
+        with:
+          name: ${{ inputs.name }}
+          tags: ${{ inputs.tags }}
+          registry: ${{ inputs.registry }}
+          namespace: ${{ inputs.namespace }}
+          user: ${{ inputs.user }}
+          password: ${{ secrets.password }}
+
+  report:
+    needs: build-push  
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Summarize
+        env:
+          REPO: ${{ needs.build-push.outputs.repo }}
+          DIGEST: ${{ needs.build-push.outputs.digest }}
+          TAGS: ${{ inputs.tags }}
+          ANNOTATIONS: ${{ needs.build-push.outputs.annotations }}
+          OCI: ${{ needs.build-push.outputs.oci }}
+          DEBSTRAP: ${{ needs.build-push.outputs.debstrap }}
+          OS_RELEASE: ${{ needs.build-push.outputs.os-release }}
+        run: |
+          # Build summary
+
+          : "${REPO:?} ${DIGEST:?} ${TAGS:?}
+          : ${ANNOTATIONS:?} ${OCI:?} ${OS_RELEASE:?}"
+
+          report=$(mktemp --tmpdir --suffix=.json)
+
+          jq -n \
+            --arg repo "$REPO" \
+            --arg digest "$DIGEST" \
+            --arg tags "$TAGS" \
+            --arg annotations "$ANNOTATIONS" \
+            --arg oci "$OCI" \
+            --arg debstrap "$DEBSTRAP" \
+            --arg os_release "$OS_RELEASE" \
+            '
+            ($annotations | fromjson) as $a |
+            ($oci | fromjson) as $o |
+            ($debstrap | fromjson) as $d |
+            ($os_release | fromjson) as $r |
+            {
+              generated: (now | todate),
+              repo: $repo,
+              digest: $digest,
+              tags: ($tags | split(" ")),
+              authors: $a["org.opencontainers.image.authors"],
+              description: $a["org.opencontainers.image.description"],
+              source: $a["org.opencontainers.image.source"],
+              revision: $a["org.opencontainers.image.revision"],
+              rootfs_diff_ids: $o.rootfs.diff_ids,
+              debstrap: ($d | with_entries(select(.key | IN("mirrors","suite","variant","packages")))),
+              os_release: ($r | with_entries(select(.key | IN("pretty_name","id","version_id"))))
+            }
+            ' > "$report"
+
+          >&2 tee -a "$GITHUB_STEP_SUMMARY" << EOF
+          \`\`\`yaml
+          $(yq -P < "$report")
+          \`\`\`
+          EOF

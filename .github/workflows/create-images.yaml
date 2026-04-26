@@ -1,0 +1,46 @@
+name: Create images
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create:
+    strategy:
+          matrix:
+            name: ${{ fromJson(vars.IMAGES) }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    uses: ./.github/workflows/_create-image.yaml
+
+    with:
+      git-repo: https://github.com/free-pmx/images.git
+      git-ref: experimental
+      name: ${{ matrix.name }}
+      tags: latest run-${{ github.run_id }}
+      registry: ghcr.io
+      namespace: ${{ github.repository_owner }}
+      user: ${{ github.actor }}
+    secrets:
+      password: ${{ secrets.GITHUB_TOKEN }}
+
+  prune:
+    needs: create
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        name: ${{ fromJson(vars.IMAGES) }}
+
+    permissions:
+      packages: write
+
+    steps:
+
+      - name: Prune GHCR repo
+        uses: free-pmx/actions/ghcr-prune@experimental
+        with:
+          name: ${{ matrix.name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
