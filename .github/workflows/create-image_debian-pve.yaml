@@ -1,0 +1,37 @@
+name: Create image - debian-pve
+
+on:
+  workflow_dispatch:
+
+jobs:
+  create:
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/_create-image.yaml
+
+    with:
+      git-repo: https://github.com/free-pmx/images.git
+      git-ref: experimental
+      name: debian-pve
+      tags: latest run-${{ github.run_id }}
+      registry: ghcr.io
+      namespace: ${{ github.repository_owner }}
+      user: ${{ github.actor }}
+    secrets:
+      password: ${{ secrets.GITHUB_TOKEN }}
+
+  prune:
+    needs: create
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write
+
+    steps:
+
+      - name: Prune GHCR repo
+        uses: free-pmx/actions/ghcr-prune@experimental
+        with:
+          name: debian-pve
+          token: ${{ secrets.GITHUB_TOKEN }}
