@@ -1,0 +1,96 @@
+name: '[Rebuild demo package]'
+
+on:
+  workflow_call:
+    inputs:
+      git-repo:
+        description: Git repository containing the package source(s)
+        required: true
+        type: string
+      git-ref:
+        description: Git reference
+        required: true
+        type: string
+      package-name:
+        description: Package name
+        required: true
+        type: string
+      build-container:
+        description: Builder container image repo
+        required: true
+        type: string
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+
+  prep:
+    runs-on: ubuntu-latest
+
+    outputs:
+      source-artifact: ${{ steps.source.outputs.name }}
+      git-commit: ${{ steps.source.outputs.git-commit }}
+      context: ${{ steps.context.outputs.json }}
+
+    steps:
+
+      - id: source
+        name: Upload git archive as artifact
+        uses: free-pmx/actions/git-archive@experimental
+        with:
+          base-name: source
+          git-repo: ${{ inputs.git-repo }}
+          git-ref: ${{ inputs.git-ref }}
+          extract: false
+
+  rebuild:
+    needs: prep
+    runs-on: ubuntu-latest
+    container:
+      image: ${{ inputs.build-container }}
+      options: --user 0
+    steps:
+
+      - id: source
+        name: Get source from artifact
+        uses: free-pmx/actions/fetch-archive@experimental
+        with:
+          name: ${{ needs.prep.outputs.source-artifact }}
+
+      - id: build-dep
+        name: Install build dependencies
+        env:
+          SRCDIR: ${{ steps.source.outputs.extract-path }}
+
+        run: |
+          cd "$SRCDIR"
+          apt-get update
+          apt-get -y build-dep .
+          
+      - id: build
+        name: Build
+        env:
+          SRCDIR: ${{ steps.source.outputs.extract-path }}
+
+        run: |
+          cd "$SRCDIR"
+          make deb
+
+      - id: out-of-tree
+        name: Isolate build artifacts out of source tree
+        env:
+          SRCDIR: ${{ steps.source.outputs.extract-path }}
+          NAME: ${{ inputs.package-name }}
+
+        run: |
+          mkdir build
+          mv "$SRCDIR/$NAME"* build
+
+      - id: artifacts
+        name: Archive build artifacts
+        uses: free-pmx/actions/archive@experimental
+        with:
+          base-name: build
+          path: build

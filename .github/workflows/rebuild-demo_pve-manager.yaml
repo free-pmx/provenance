@@ -1,0 +1,13 @@
+name: Rebuild demo package - pve-manager
+
+on:
+  workflow_dispatch:
+
+jobs:
+  pve-manager:
+    uses: ./.github/workflows/_rebuild-demo.yaml
+    with:
+      git-repo: git://git.proxmox.com/git/pve-manager.git
+      git-ref: master
+      package-name: pve-manager
+      build-container: ghcr.io/free-pmx/debian-pve:latest
